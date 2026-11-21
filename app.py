@@ -22,6 +22,7 @@ import logging
 import os
 import re
 import sys
+import threading
 from pathlib import Path
 
 import httpx
@@ -224,6 +225,34 @@ def verify():
     return "verification failed", 403
 
 
+def _process_event(event: dict) -> None:
+    """Answer one messaging event. Runs in a background thread so the
+    webhook can answer Meta immediately (Meta gives up after ~20s, while
+    a sleeping free Render instance can take a minute to wake up)."""
+    try:
+        sender = (event.get("sender") or {}).get("id")
+        if not sender:
+            return
+        if "postback" in event:
+            payload = (event["postback"] or {}).get("payload", "")
+            log.info("postback %s from %s", payload, sender)
+            if payload in ("GET_STARTED", "START"):
+                _send_text(sender, WELCOME)
+            return
+        msg = event.get("message") or {}
+        if msg.get("is_echo"):
+            return
+        text = (msg.get("text") or "").strip()
+        if not text:
+            return
+        log.info("message from %s: %s", sender, text[:120])
+        _typing(sender)
+        reply = handle_text(text)
+        _send_text(sender, reply)
+    except Exception:  # noqa: BLE001 - a failed reply must not break the webhook
+        log.exception("failed to process messaging event")
+
+
 @app.post("/webhook")
 def receive():
     body = request.get_json(silent=True) or {}
@@ -231,25 +260,9 @@ def receive():
         return jsonify({"status": "ignored"}), 200
     for entry in body.get("entry", []):
         for event in entry.get("messaging", []):
-            sender = (event.get("sender") or {}).get("id")
-            if not sender:
-                continue
-            if "postback" in event:
-                payload = (event["postback"] or {}).get("payload", "")
-                log.info("postback %s from %s", payload, sender)
-                if payload in ("GET_STARTED", "START"):
-                    _send_text(sender, WELCOME)
-                continue
-            msg = event.get("message") or {}
-            if msg.get("is_echo"):
-                continue
-            text = (msg.get("text") or "").strip()
-            if not text:
-                continue
-            log.info("message from %s: %s", sender, text[:120])
-            _typing(sender)
-            reply = handle_text(text)
-            _send_text(sender, reply)
+            threading.Thread(
+                target=_process_event, args=(event,), daemon=True
+            ).start()
     return jsonify({"status": "ok"}), 200
 
 
